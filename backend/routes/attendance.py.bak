@@ -1,0 +1,284 @@
+from flask import Blueprint, request, jsonify
+from flask_jwt_extended import get_jwt_identity
+from models import db, User, Class, Attendance, FaceEncoding, ClassEnrollment, SystemSetting
+from middleware.auth import student_only, log_activity
+from utils.geolocation import validate_location, is_within_time_window
+from utils.face_recognition_utils import verify_face, deserialize_encoding, validate_face_image
+from utils.helpers import allowed_file, get_client_ip
+from datetime import datetime, timedelta
+
+attendance_bp = Blueprint('attendance', __name__)
+
+@attendance_bp.route('/mark', methods=['POST'])
+@student_only
+def mark_attendance():
+    """Mark attendance with geolocation and face verification"""
+    user_id = get_jwt_identity()
+    user = User.query.get(user_id)
+    
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    
+    data = request.get_json()
+    
+    # Required fields
+    required_fields = ['class_id', 'latitude', 'longitude']
+    if not all(field in data for field in required_fields):
+        return jsonify({'error': 'Missing required fields'}), 400
+    
+    class_id = data['class_id']
+    student_lat = data['latitude']
+    student_lon = data['longitude']
+    
+    # Get class
+    class_obj = Class.query.get(class_id)
+    if not class_obj:
+        return jsonify({'error': 'Class not found'}), 404
+    
+    # Check if class is active
+    if not class_obj.is_active:
+        return jsonify({'error': 'Class is not active'}), 400
+    
+    # Check if attendance is enabled
+    if not class_obj.attendance_enabled:
+        return jsonify({'error': 'Attendance is currently disabled for this class'}), 400
+    
+    # Check if student is enrolled
+    enrollment = ClassEnrollment.query.filter_by(
+        class_id=class_id,
+        student_id=user_id,
+        is_active=True
+    ).first()
+    
+    if not enrollment:
+        return jsonify({'error': 'You are not enrolled in this class'}), 403
+    
+    # Check if already marked attendance today
+    today = datetime.utcnow().date()
+    existing = Attendance.query.filter(
+        Attendance.student_id == user_id,
+        Attendance.class_id == class_id,
+        db.func.date(Attendance.timestamp) == today
+    ).first()
+    
+    if existing:
+        return jsonify({'error': 'Attendance already marked for today'}), 400
+    
+    # Check geolocation (if enabled globally)
+    geolocation_enabled = SystemSetting.query.filter_by(key='geolocation_enabled').first()
+    if geolocation_enabled and geolocation_enabled.value.lower() == 'true':
+        is_valid_location, distance = validate_location(
+            student_lat, student_lon,
+            class_obj.latitude, class_obj.longitude,
+            class_obj.radius
+        )
+        
+        if not is_valid_location:
+            log_activity('attendance_failed', 'attendance', None, {
+                'reason': 'outside_radius',
+                'distance': distance,
+                'class_id': class_id
+            })
+            return jsonify({
+                'error': f'You are outside the attendance radius. Distance: {distance}m, Allowed: {class_obj.radius}m'
+            }), 400
+    else:
+        distance = 0
+    
+    # Check time window
+    buffer_minutes = 15
+    if not is_within_time_window(class_obj.start_time, class_obj.end_time, buffer_minutes):
+        return jsonify({'error': 'Attendance can only be marked during class time'}), 400
+    
+    # Determine status (PRESENT or LATE)
+    current_time = datetime.now().time()
+    late_threshold = (datetime.combine(datetime.today(), class_obj.start_time) + 
+                     timedelta(minutes=10)).time()
+    status = 'LATE' if current_time > late_threshold else 'PRESENT'
+    
+    # Face recognition verification (if enabled)
+    face_match_score = None
+    face_recognition_enabled = SystemSetting.query.filter_by(key='face_recognition_enabled').first()
+    
+    if face_recognition_enabled and face_recognition_enabled.value.lower() == 'true':
+        # Check if student has registered face
+        face_encoding = FaceEncoding.query.filter_by(user_id=user_id, is_active=True).first()
+        
+        if not face_encoding:
+            return jsonify({'error': 'Face not registered. Please register your face first.'}), 400
+        
+        # Check if face image is provided
+        if 'image' not in request.files:
+            return jsonify({'error': 'Face image required for verification'}), 400
+        
+        file = request.files['image']
+        
+        if not file or file.filename == '':
+            return jsonify({'error': 'No face image provided'}), 400
+        
+        if not allowed_file(file.filename):
+            return jsonify({'error': 'Invalid image format'}), 400
+        
+        # Read and validate image
+        image_data = file.read()
+        is_valid, message = validate_face_image(image_data)
+        
+        if not is_valid:
+            return jsonify({'error': f'Face validation failed: {message}'}), 400
+        
+        # Verify face
+        known_encoding = deserialize_encoding(face_encoding.encoding)
+        
+        # Get face match threshold
+        threshold_setting = SystemSetting.query.filter_by(key='face_match_threshold').first()
+        threshold = float(threshold_setting.value) if threshold_setting else 0.6
+        
+        is_match, confidence, error = verify_face(known_encoding, image_data, threshold)
+        
+        if error:
+            return jsonify({'error': f'Face verification failed: {error}'}), 400
+        
+        if not is_match:
+            log_activity('attendance_failed', 'attendance', None, {
+                'reason': 'face_mismatch',
+                'confidence': confidence,
+                'class_id': class_id
+            })
+            return jsonify({
+                'error': 'Face verification failed. Please ensure proper lighting and face visibility.'
+            }), 400
+        
+        face_match_score = confidence
+    
+    # Create attendance record
+    attendance = Attendance(
+        student_id=user_id,
+        class_id=class_id,
+        latitude=student_lat,
+        longitude=student_lon,
+        distance=distance,
+        face_match_score=face_match_score,
+        status=status,
+        ip_address=get_client_ip(request),
+        device_id=data.get('device_id')
+    )
+    
+    db.session.add(attendance)
+    db.session.commit()
+    
+    log_activity('attendance_marked', 'attendance', attendance.id, {
+        'class_id': class_id,
+        'status': status,
+        'distance': distance,
+        'face_match_score': face_match_score
+    })
+    
+    return jsonify({
+        'message': 'Attendance marked successfully',
+        'attendance': attendance.to_dict(),
+        'status': status,
+        'distance': distance,
+        'face_match_score': face_match_score
+    }), 201
+
+@attendance_bp.route('/validate-location', methods=['POST'])
+@student_only
+def validate_student_location():
+    """Validate if student is within attendance radius (without marking attendance)"""
+    data = request.get_json()
+    
+    if not all(k in data for k in ['class_id', 'latitude', 'longitude']):
+        return jsonify({'error': 'Missing required fields'}), 400
+    
+    class_obj = Class.query.get(data['class_id'])
+    if not class_obj:
+        return jsonify({'error': 'Class not found'}), 404
+    
+    is_valid, distance = validate_location(
+        data['latitude'], data['longitude'],
+        class_obj.latitude, class_obj.longitude,
+        class_obj.radius
+    )
+    
+    return jsonify({
+        'is_valid': is_valid,
+        'distance': distance,
+        'allowed_radius': class_obj.radius,
+        'message': 'Within radius' if is_valid else 'Outside radius'
+    }), 200
+
+@attendance_bp.route('/check-eligibility/<class_id>', methods=['GET'])
+@student_only
+def check_attendance_eligibility(class_id):
+    """Check if student is eligible to mark attendance"""
+    user_id = get_jwt_identity()
+    
+    # Get class
+    class_obj = Class.query.get(class_id)
+    if not class_obj:
+        return jsonify({'error': 'Class not found'}), 404
+    
+    # Check enrollment
+    enrollment = ClassEnrollment.query.filter_by(
+        class_id=class_id,
+        student_id=user_id,
+        is_active=True
+    ).first()
+    
+    if not enrollment:
+        return jsonify({
+            'eligible': False,
+            'reason': 'Not enrolled in this class'
+        }), 200
+    
+    # Check if already marked
+    today = datetime.utcnow().date()
+    existing = Attendance.query.filter(
+        Attendance.student_id == user_id,
+        Attendance.class_id == class_id,
+        db.func.date(Attendance.timestamp) == today
+    ).first()
+    
+    if existing:
+        return jsonify({
+            'eligible': False,
+            'reason': 'Attendance already marked today',
+            'attendance': existing.to_dict()
+        }), 200
+    
+    # Check if class is active
+    if not class_obj.is_active or not class_obj.attendance_enabled:
+        return jsonify({
+            'eligible': False,
+            'reason': 'Attendance is not enabled for this class'
+        }), 200
+    
+    # Check time window
+    buffer_minutes = 15
+    in_time_window = is_within_time_window(
+        class_obj.start_time, 
+        class_obj.end_time, 
+        buffer_minutes
+    )
+    
+    if not in_time_window:
+        return jsonify({
+            'eligible': False,
+            'reason': 'Not within class time window'
+        }), 200
+    
+    # Check face registration
+    face_required = SystemSetting.query.filter_by(key='face_recognition_enabled').first()
+    if face_required and face_required.value.lower() == 'true':
+        has_face = FaceEncoding.query.filter_by(user_id=user_id, is_active=True).first() is not None
+        if not has_face:
+            return jsonify({
+                'eligible': False,
+                'reason': 'Face not registered'
+            }), 200
+    
+    return jsonify({
+        'eligible': True,
+        'class': class_obj.to_dict(),
+        'message': 'You can mark attendance now'
+    }), 200

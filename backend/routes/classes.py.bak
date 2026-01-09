@@ -1,0 +1,49 @@
+from flask import Blueprint, request, jsonify
+from models import db, Class
+from middleware.auth import token_required
+from utils.helpers import paginate_query
+
+classes_bp = Blueprint('classes', __name__)
+
+@classes_bp.route('/', methods=['GET'])
+@token_required
+def get_classes():
+    """Get all active classes"""
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 20, type=int)
+    search = request.args.get('search')
+    
+    query = Class.query.filter_by(is_active=True)
+    
+    if search:
+        query = query.filter(
+            db.or_(
+                Class.name.ilike(f'%{search}%'),
+                Class.description.ilike(f'%{search}%')
+            )
+        )
+    
+    classes, total_pages, total_items = paginate_query(query, page, per_page)
+    
+    return jsonify({
+        'classes': [cls.to_dict() for cls in classes],
+        'pagination': {
+            'page': page,
+            'per_page': per_page,
+            'total_pages': total_pages,
+            'total_items': total_items
+        }
+    }), 200
+
+@classes_bp.route('/<class_id>', methods=['GET'])
+@token_required
+def get_class(class_id):
+    """Get class details"""
+    class_obj = Class.query.get(class_id)
+    
+    if not class_obj:
+        return jsonify({'error': 'Class not found'}), 404
+    
+    return jsonify({
+        'class': class_obj.to_dict()
+    }), 200

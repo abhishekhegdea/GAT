@@ -1,0 +1,55 @@
+# Docker Build Context - Excludes
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Virtual Environments
+venv/
+env/
+ENV/
+.venv
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+
+# Environment & Configuration
+.env
+.env.local
+.env.*.local
+firebase-credentials.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Project Specific
+uploads/
+logs/
+*.log
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# OS
+.DS_Store
+.thumbs.db
+
+# Temporary
+temp/
+tmp/
+*.tmp

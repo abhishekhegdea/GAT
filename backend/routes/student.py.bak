@@ -1,0 +1,182 @@
+from flask import Blueprint, request, jsonify
+from flask_jwt_extended import get_jwt_identity
+from models import db, User, FaceEncoding, ClassEnrollment
+from middleware.auth import student_only, log_activity
+from utils.face_recognition_utils import encode_face, serialize_encoding, validate_face_image
+from utils.helpers import allowed_file
+from datetime import datetime
+import os
+from werkzeug.utils import secure_filename
+
+student_bp = Blueprint('student', __name__)
+
+@student_bp.route('/profile', methods=['GET'])
+@student_only
+def get_profile():
+    """Get student profile"""
+    user_id = get_jwt_identity()
+    user = User.query.get(user_id)
+    
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    
+    # Check if face is registered
+    has_face = FaceEncoding.query.filter_by(user_id=user_id, is_active=True).first() is not None
+    
+    # Get enrolled classes
+    enrollments = ClassEnrollment.query.filter_by(student_id=user_id, is_active=True).all()
+    classes = [enrollment.class_obj.to_dict() for enrollment in enrollments]
+    
+    return jsonify({
+        'profile': user.to_dict(),
+        'has_face_registered': has_face,
+        'enrolled_classes': classes
+    }), 200
+
+@student_bp.route('/register-face', methods=['POST'])
+@student_only
+def register_face():
+    """Register student's face"""
+    user_id = get_jwt_identity()
+    user = User.query.get(user_id)
+    
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    
+    # Check if face already registered
+    existing = FaceEncoding.query.filter_by(user_id=user_id, is_active=True).first()
+    if existing:
+        return jsonify({'error': 'Face already registered. Contact admin to reset.'}), 400
+    
+    # Check if image file is provided
+    if 'image' not in request.files:
+        return jsonify({'error': 'No image file provided'}), 400
+    
+    file = request.files['image']
+    
+    if file.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+    
+    if not allowed_file(file.filename):
+        return jsonify({'error': 'Invalid file type. Only PNG, JPG, JPEG allowed'}), 400
+    
+    # Read image data
+    image_data = file.read()
+    
+    # Validate image
+    is_valid, message = validate_face_image(image_data)
+    if not is_valid:
+        return jsonify({'error': message}), 400
+    
+    # Encode face
+    encoding, error = encode_face(image_data)
+    if error:
+        return jsonify({'error': error}), 400
+    
+    # Save image
+    from flask import current_app
+    filename = secure_filename(f"{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
+    filepath = os.path.join(current_app.config['FACE_IMAGES_FOLDER'], filename)
+    
+    with open(filepath, 'wb') as f:
+        f.write(image_data)
+    
+    # Save encoding to database
+    face_encoding = FaceEncoding(
+        user_id=user_id,
+        encoding=serialize_encoding(encoding),
+        image_path=filepath
+    )
+    
+    db.session.add(face_encoding)
+    db.session.commit()
+    
+    log_activity('face_registered', 'face_encoding', face_encoding.id)
+    
+    return jsonify({
+        'message': 'Face registered successfully',
+        'face_encoding': face_encoding.to_dict()
+    }), 201
+
+@student_bp.route('/classes', methods=['GET'])
+@student_only
+def get_enrolled_classes():
+    """Get classes the student is enrolled in"""
+    user_id = get_jwt_identity()
+    
+    enrollments = ClassEnrollment.query.filter_by(student_id=user_id, is_active=True).all()
+    classes = [enrollment.class_obj.to_dict() for enrollment in enrollments]
+    
+    return jsonify({
+        'classes': classes,
+        'count': len(classes)
+    }), 200
+
+@student_bp.route('/attendance/history', methods=['GET'])
+@student_only
+def get_attendance_history():
+    """Get student's attendance history"""
+    from models import Attendance
+    user_id = get_jwt_identity()
+    
+    class_id = request.args.get('class_id')
+    date_from = request.args.get('date_from')
+    date_to = request.args.get('date_to')
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 20, type=int)
+    
+    query = Attendance.query.filter_by(student_id=user_id)
+    
+    if class_id:
+        query = query.filter_by(class_id=class_id)
+    if date_from:
+        query = query.filter(Attendance.timestamp >= datetime.fromisoformat(date_from))
+    if date_to:
+        query = query.filter(Attendance.timestamp <= datetime.fromisoformat(date_to))
+    
+    query = query.order_by(Attendance.timestamp.desc())
+    
+    from utils.helpers import paginate_query
+    records, total_pages, total_items = paginate_query(query, page, per_page)
+    
+    return jsonify({
+        'attendance': [record.to_dict() for record in records],
+        'pagination': {
+            'page': page,
+            'per_page': per_page,
+            'total_pages': total_pages,
+            'total_items': total_items
+        }
+    }), 200
+
+@student_bp.route('/attendance/statistics', methods=['GET'])
+@student_only
+def get_attendance_statistics():
+    """Get student's attendance statistics"""
+    from models import Attendance
+    user_id = get_jwt_identity()
+    
+    class_id = request.args.get('class_id')
+    
+    query = Attendance.query.filter_by(student_id=user_id)
+    
+    if class_id:
+        query = query.filter_by(class_id=class_id)
+    
+    total = query.count()
+    present = query.filter_by(status='PRESENT').count()
+    late = query.filter_by(status='LATE').count()
+    absent = query.filter_by(status='ABSENT').count()
+    
+    # Calculate percentage
+    attendance_rate = (present / total * 100) if total > 0 else 0
+    
+    return jsonify({
+        'statistics': {
+            'total': total,
+            'present': present,
+            'late': late,
+            'absent': absent,
+            'attendance_rate': round(attendance_rate, 2)
+        }
+    }), 200
